@@ -1,0 +1,124 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isParent(uid) {
+      return signedIn()
+        && request.auth.uid == uid
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function isChild() {
+      return signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
+    function isFamilyChild(parentUid, childUid) {
+      let childPath = /databases/$(database)/documents/users/$(parentUid)/children/$(childUid);
+      return isChild()
+        && request.auth.uid == childUid
+        && exists(childPath)
+        && get(childPath).data.parentUid == parentUid;
+    }
+
+    function isConnectedChild(parentUid, childUid) {
+      let childPath = /databases/$(database)/documents/users/$(parentUid)/children/$(childUid);
+      return isChild()
+        && request.auth.uid == childUid
+        && existsAfter(childPath)
+        && getAfter(childPath).data.parentUid == parentUid
+        && getAfter(childPath).data.appInventoryConsent == true;
+    }
+
+    function familyCodeAfter(code, parentUid, childUid) {
+      let path = /databases/$(database)/documents/familyCodes/$(code);
+      return existsAfter(path)
+        && getAfter(path).data.parentUid == parentUid
+        && getAfter(path).data.claimed == true
+        && getAfter(path).data.childUid == childUid;
+    }
+
+    match /users/{parentUid} {
+      allow read: if isParent(parentUid);
+      allow write: if isParent(parentUid);
+
+      match /children/{childUid} {
+        allow read: if isParent(parentUid);
+        allow create: if isChild()
+          && request.auth.uid == childUid
+          && request.resource.data.uid == childUid
+          && request.resource.data.parentUid == parentUid
+          && familyCodeAfter(request.resource.data.familyCode, parentUid, childUid)
+          && request.resource.data.appInventoryPlatform is string
+          && (request.resource.data.appInventoryPlatform != 'android'
+            || request.resource.data.appInventoryConsent == true)
+          && request.resource.data.installedApps is list
+          && request.resource.data.installedApps.size() <= 200
+          && existsAfter(/databases/$(database)/documents/childProfiles/$(childUid))
+          && getAfter(/databases/$(database)/documents/childProfiles/$(childUid)).data.parentUid == parentUid;
+        allow update: if isParent(parentUid)
+          || (isChild()
+            && request.auth.uid == childUid
+            && resource.data.parentUid == parentUid
+            && request.resource.data.parentUid == parentUid
+            && request.resource.data.appInventoryPlatform == 'android'
+            && request.resource.data.appInventoryConsent == true
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['installedApps', 'appInventoryPlatform', 'appInventoryUpdatedAt', 'appInventoryConsent'])
+            && request.resource.data.installedApps is list
+            && request.resource.data.installedApps.size() <= 200);
+        allow delete: if isParent(parentUid);
+
+        match /installedApps/{packageName} {
+          allow read: if isParent(parentUid) || isFamilyChild(parentUid, childUid);
+          allow create, update: if isConnectedChild(parentUid, childUid)
+            && request.resource.data.keys().hasOnly(['packageName', 'appName', 'iconBase64', 'updatedAt'])
+            && request.resource.data.packageName == packageName
+            && request.resource.data.appName is string
+            && (!('iconBase64' in request.resource.data)
+              || (request.resource.data.iconBase64 is string
+                && request.resource.data.iconBase64.size() <= 60000));
+          allow delete: if isParent(parentUid) || isConnectedChild(parentUid, childUid);
+        }
+      }
+    }
+
+    match /familyCodes/{code} {
+      allow get: if signedIn();
+      allow list: if isParent(resource.data.parentUid);
+      allow create: if isParent(request.resource.data.parentUid)
+        && request.resource.data.active == true
+        && request.resource.data.claimed == false;
+      allow update: if isParent(resource.data.parentUid)
+        || (isChild()
+          && resource.data.active == true
+          && resource.data.claimed == false
+          && request.resource.data.parentUid == resource.data.parentUid
+          && request.resource.data.claimed == true
+          && request.resource.data.childUid == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimed', 'childUid', 'childName'])
+          && existsAfter(/databases/$(database)/documents/childProfiles/$(request.auth.uid))
+          && getAfter(/databases/$(database)/documents/childProfiles/$(request.auth.uid)).data.parentUid == resource.data.parentUid);
+      allow delete: if isParent(resource.data.parentUid);
+    }
+
+    match /childProfiles/{childUid} {
+      allow read: if signedIn()
+        && (request.auth.uid == childUid || resource.data.parentUid == request.auth.uid);
+      allow create: if isChild()
+        && request.auth.uid == childUid
+        && request.resource.data.uid == childUid
+        && familyCodeAfter(request.resource.data.familyCode, request.resource.data.parentUid, childUid);
+      allow update: if isChild()
+        && request.auth.uid == childUid
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.parentUid == resource.data.parentUid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['appInventoryConsent'])
+        && request.resource.data.appInventoryConsent == true;
+      allow delete: if isParent(resource.data.parentUid);
+    }
+  }
+}

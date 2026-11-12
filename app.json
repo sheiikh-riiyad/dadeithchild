@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "MyApp",
+    "name": "Nestguard",
     "slug": "MyApp",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -11,6 +11,8 @@
       "icon": "./assets/expo.icon"
     },
     "android": {
+      "package": "com.dadwithchild.app",
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -24,6 +26,7 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "./plugins/with-launcher-app-queries",
       "expo-router",
       [
         "expo-splash-screen",
@@ -31,6 +34,16 @@
           "backgroundColor": "#208AEF",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
+        }
+      ],
+      "@react-native-firebase/app",
+      "@react-native-google-signin/google-signin",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "kotlinVersion": "2.4.0"
+          }
         }
       ]
     ],
