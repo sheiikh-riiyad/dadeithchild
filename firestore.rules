@@ -33,6 +33,15 @@ service cloud.firestore {
         && getAfter(childPath).data.appInventoryConsent == true;
     }
 
+    function isLocationSharingChild(parentUid, childUid) {
+      let childPath = /databases/$(database)/documents/users/$(parentUid)/children/$(childUid);
+      return isChild()
+        && request.auth.uid == childUid
+        && exists(childPath)
+        && get(childPath).data.parentUid == parentUid
+        && get(childPath).data.locationSharingEnabled == true;
+    }
+
     function familyCodeAfter(code, parentUid, childUid) {
       let path = /databases/$(database)/documents/familyCodes/$(code);
       return existsAfter(path)
@@ -68,7 +77,14 @@ service cloud.firestore {
             && request.resource.data.appInventoryConsent == true
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['installedApps', 'appInventoryPlatform', 'appInventoryUpdatedAt', 'appInventoryConsent'])
             && request.resource.data.installedApps is list
-            && request.resource.data.installedApps.size() <= 200);
+            && request.resource.data.installedApps.size() <= 200)
+          || (isChild()
+            && request.auth.uid == childUid
+            && resource.data.parentUid == parentUid
+            && request.resource.data.parentUid == parentUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['locationSharingEnabled', 'locationSharingUpdatedAt'])
+            && request.resource.data.locationSharingEnabled is bool
+            && request.resource.data.locationSharingUpdatedAt == request.time);
         allow delete: if isParent(parentUid);
 
         match /installedApps/{packageName} {
@@ -81,6 +97,23 @@ service cloud.firestore {
               || (request.resource.data.iconBase64 is string
                 && request.resource.data.iconBase64.size() <= 60000));
           allow delete: if isParent(parentUid) || isConnectedChild(parentUid, childUid);
+        }
+
+        match /liveLocation/{locationId} {
+          allow read: if isParent(parentUid);
+          allow create, update: if locationId == 'current'
+            && isLocationSharingChild(parentUid, childUid)
+            && request.resource.data.keys().hasOnly(['latitude', 'longitude', 'accuracy', 'updatedAt'])
+            && request.resource.data.latitude is number
+            && request.resource.data.latitude >= -90
+            && request.resource.data.latitude <= 90
+            && request.resource.data.longitude is number
+            && request.resource.data.longitude >= -180
+            && request.resource.data.longitude <= 180
+            && request.resource.data.accuracy is number
+            && request.resource.data.accuracy >= 0
+            && request.resource.data.updatedAt == request.time;
+          allow delete: if locationId == 'current' && isFamilyChild(parentUid, childUid);
         }
       }
     }

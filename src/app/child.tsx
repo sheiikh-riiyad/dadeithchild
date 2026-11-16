@@ -1,10 +1,12 @@
 import { getAuth, onAuthStateChanged } from '@react-native-firebase/auth';
 import { doc, getFirestore, onSnapshot } from '@react-native-firebase/firestore';
 import { router } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import * as Location from 'expo-location';
+import { ActivityIndicator, Alert, AppState, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { signOutChild, syncInstalledApps } from '@/lib/family';
+import { startChildLocationSharing, stopChildLocationSharing } from '@/lib/location-sharing';
 
 const auth = getAuth();
 const firestore = getFirestore();
@@ -16,7 +18,37 @@ export default function ChildDashboard() {
   const [profile, setProfile] = useState<ChildProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSharingApps, setIsSharingApps] = useState(false);
+  const [isSharingLocation, setIsSharingLocation] = useState(false);
+  const [isUpdatingLocation, setIsUpdatingLocation] = useState(false);
   const hasSyncedApps = useRef(false);
+  const locationSubscription = useRef<Awaited<ReturnType<typeof startChildLocationSharing>> | null>(null);
+  const locationSession = useRef<{ parentUid: string; childUid: string } | null>(null);
+  const locationStartGeneration = useRef(0);
+  const pendingStopError = useRef(false);
+  const resetLocationForChild = useRef<string | null>(null);
+
+  const stopSharingLocation = useCallback(async (showError = true) => {
+    locationStartGeneration.current += 1;
+    const session = locationSession.current;
+    locationSubscription.current?.remove();
+    locationSubscription.current = null;
+    locationSession.current = null;
+    setIsSharingLocation(false);
+    if (!session) return;
+
+    setIsUpdatingLocation(true);
+    try {
+      await stopChildLocationSharing(session.parentUid, session.childUid);
+    } catch {
+      if (showError) {
+        Alert.alert('Could not stop location sharing', 'Check your connection and try again. The parent will not treat an old location as live.');
+      } else {
+        pendingStopError.current = true;
+      }
+    } finally {
+      setIsUpdatingLocation(false);
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -25,7 +57,9 @@ export default function ChildDashboard() {
     const stopAuth = onAuthStateChanged(auth, (user) => {
       stopProfile?.();
       stopProfile = undefined;
+      if (resetLocationForChild.current !== user?.uid) resetLocationForChild.current = null;
       if (!user || !user.isAnonymous) {
+        void stopSharingLocation(false);
         router.replace('/');
         setIsLoading(false);
         return;
@@ -37,6 +71,12 @@ export default function ChildDashboard() {
         } else {
           const childProfile = snapshot.data() as ChildProfile;
           setProfile(childProfile);
+          if (childProfile.parentUid && resetLocationForChild.current !== user.uid) {
+            resetLocationForChild.current = user.uid;
+            void stopChildLocationSharing(childProfile.parentUid, user.uid).catch(() => {
+              if (active) Alert.alert('Could not clear previous location sharing', 'Check your connection before sharing a new location.');
+            });
+          }
           if (!hasSyncedApps.current && childProfile.parentUid && childProfile.appInventoryConsent) {
             hasSyncedApps.current = true;
             syncInstalledApps(childProfile.parentUid).catch(() => {
@@ -51,6 +91,43 @@ export default function ChildDashboard() {
       });
     });
     return () => { active = false; stopAuth(); stopProfile?.(); };
+  }, [stopSharingLocation]);
+
+  useEffect(() => {
+    const appStateSubscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background' || (nextState === 'inactive' && locationSession.current)) {
+        locationStartGeneration.current += 1;
+        const session = locationSession.current;
+        locationSubscription.current?.remove();
+        locationSubscription.current = null;
+        locationSession.current = null;
+        setIsSharingLocation(false);
+        if (session) {
+          void stopChildLocationSharing(session.parentUid, session.childUid).catch(() => {
+            pendingStopError.current = true;
+          });
+        }
+      } else if (nextState === 'active') {
+        if (pendingStopError.current) {
+          pendingStopError.current = false;
+          Alert.alert('Could not stop location sharing', 'Check your connection. The parent will not treat an old location as live.');
+        }
+      }
+    });
+
+    return () => {
+      appStateSubscription.remove();
+      const session = locationSession.current;
+      locationStartGeneration.current += 1;
+      locationSubscription.current?.remove();
+      locationSubscription.current = null;
+      locationSession.current = null;
+      if (session) {
+        void stopChildLocationSharing(session.parentUid, session.childUid).catch(() => {
+          console.error('Could not stop location sharing after leaving the child portal.');
+        });
+      }
+    };
   }, []);
 
   const handleShareAppNames = async () => {
@@ -68,8 +145,52 @@ export default function ChildDashboard() {
     }
   };
 
+  const handleStartLocationSharing = async () => {
+    if (!profile?.parentUid || isUpdatingLocation || AppState.currentState !== 'active') return;
+
+    const user = auth.currentUser;
+    if (!user?.isAnonymous) return;
+
+    const generation = ++locationStartGeneration.current;
+    setIsUpdatingLocation(true);
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+      if (generation !== locationStartGeneration.current) return;
+      if (!permission.granted) {
+        Alert.alert('Location permission not granted', 'To share your location, allow Nestguard to access location only while you are using the app.');
+        return;
+      }
+
+      locationSession.current = { parentUid: profile.parentUid, childUid: user.uid };
+      pendingStopError.current = false;
+      const subscription = await startChildLocationSharing(profile.parentUid, user.uid, (error) => {
+        console.error('Location sharing update failed:', error);
+        Alert.alert('Location update failed', 'Location sharing will stop because Nestguard could not update your location.');
+        void stopSharingLocation();
+      });
+
+      if (generation !== locationStartGeneration.current || AppState.currentState !== 'active') {
+        subscription.remove();
+        await stopChildLocationSharing(profile.parentUid, user.uid);
+        locationSession.current = null;
+        return;
+      }
+
+      locationSubscription.current = subscription;
+      setIsSharingLocation(true);
+    } catch {
+      locationSession.current = null;
+      if (generation === locationStartGeneration.current) {
+        Alert.alert('Could not start location sharing', 'Check the location permission and your connection, then try again.');
+      }
+    } finally {
+      setIsUpdatingLocation(false);
+    }
+  };
+
   const handleSignOut = async () => {
     try {
+      await stopSharingLocation();
       await signOutChild();
       router.replace('/');
     } catch {
@@ -79,7 +200,7 @@ export default function ChildDashboard() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <View style={styles.container}>
+      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
         <View style={styles.brandRow}>
           <View style={styles.brandMark}><Text style={styles.brandMarkText}>N</Text></View>
           <View><Text style={styles.brandName}>nestguard</Text><Text style={styles.brandCaption}>CHILD DEVICE</Text></View>
@@ -112,18 +233,47 @@ export default function ChildDashboard() {
           ) : (
             <Text style={styles.privacyNote}>Installed-app names are available only on Android.</Text>
           )}
+          {profile ? (
+            <View style={styles.locationCard}>
+              <View style={styles.locationHeader}>
+                <View style={[styles.locationDot, isSharingLocation && styles.locationDotActive]} />
+                <Text style={styles.locationTitle}>{isSharingLocation ? 'Location sharing is on' : 'Location sharing is off'}</Text>
+              </View>
+              <Text style={styles.locationBody}>Your parent can see your latest location while you choose to share and Nestguard stays open. Sharing stops when the app goes to the background, and you can stop it any time. If the device is offline, the last point may remain visible for up to one minute before it is marked stale.</Text>
+              <Pressable
+                accessibilityRole="button"
+                disabled={isUpdatingLocation}
+                onPress={() => {
+                  if (isSharingLocation) void stopSharingLocation();
+                  else void handleStartLocationSharing();
+                }}
+                style={({ pressed }) => [styles.locationButton, isSharingLocation && styles.locationButtonStop, pressed && styles.pressed, isUpdatingLocation && styles.disabled]}>
+                {isUpdatingLocation ? <ActivityIndicator color={colors.white} /> : null}
+                <Text style={styles.locationButtonText}>
+                  {isUpdatingLocation ? 'Updating location sharing…' : isSharingLocation ? 'Stop sharing location' : 'Share my location'}
+                </Text>
+              </Pressable>
+            </View>
+          ) : null}
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => router.push('/child-permissions')}
+            style={({ pressed }) => [styles.permissionsButton, pressed && styles.pressed]}>
+            <Text style={styles.permissionsButtonText}>Privacy & permissions</Text>
+            <Text style={styles.permissionsArrow}>›</Text>
+          </Pressable>
         </View>
         <Pressable accessibilityRole="button" onPress={handleSignOut} style={({ pressed }) => [styles.signOutButton, pressed && styles.pressed]}>
           <Text style={styles.signOutText}>Sign out of this device</Text>
         </Pressable>
-      </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.background },
-  container: { flex: 1, width: '100%', maxWidth: 520, alignSelf: 'center', paddingHorizontal: 22, paddingTop: 12, justifyContent: 'space-between', paddingBottom: 25 },
+  container: { flexGrow: 1, width: '100%', maxWidth: 520, alignSelf: 'center', paddingHorizontal: 22, paddingTop: 12, justifyContent: 'space-between', paddingBottom: 25 },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   brandMark: { width: 36, height: 36, borderRadius: 13, backgroundColor: colors.green, alignItems: 'center', justifyContent: 'center' },
   brandMarkText: { color: colors.white, fontSize: 17, fontWeight: '900' },
@@ -145,6 +295,18 @@ const styles = StyleSheet.create({
   shareButtonText: { color: colors.white, fontSize: 11, fontWeight: '800' },
   disabled: { opacity: 0.7 },
   privacyNote: { color: colors.muted, fontSize: 10, lineHeight: 15, textAlign: 'center', marginTop: 16 },
+  locationCard: { width: '100%', padding: 14, marginTop: 16, borderRadius: 13, backgroundColor: '#F3F6F4' },
+  locationHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  locationDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#A3ADA8' },
+  locationDotActive: { backgroundColor: colors.green },
+  locationTitle: { color: colors.ink, fontSize: 11, fontWeight: '900' },
+  locationBody: { color: colors.muted, fontSize: 10, lineHeight: 15, marginTop: 7 },
+  locationButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 11, borderRadius: 10, backgroundColor: colors.green },
+  locationButtonStop: { backgroundColor: '#9B4A42' },
+  locationButtonText: { color: colors.white, fontSize: 10, fontWeight: '800' },
+  permissionsButton: { width: '100%', minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 13, marginTop: 16, borderRadius: 11, backgroundColor: '#F3F6F4' },
+  permissionsButtonText: { color: colors.green, fontSize: 11, fontWeight: '800' },
+  permissionsArrow: { color: colors.green, fontSize: 20, fontWeight: '700' },
   signOutButton: { minHeight: 48, alignItems: 'center', justifyContent: 'center' },
   signOutText: { color: colors.muted, fontSize: 11, fontWeight: '800' },
   pressed: { opacity: 0.7 },

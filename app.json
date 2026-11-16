@@ -36,6 +36,16 @@
           "imageWidth": 76
         }
       ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Nestguard to share your location with your parent only while you choose to share and the app is open.",
+          "locationAlwaysAndWhenInUsePermission": false,
+          "locationAlwaysPermission": false,
+          "isIosBackgroundLocationEnabled": false,
+          "isAndroidBackgroundLocationEnabled": false
+        }
+      ],
       "@react-native-firebase/app",
       "@react-native-google-signin/google-signin",
       [

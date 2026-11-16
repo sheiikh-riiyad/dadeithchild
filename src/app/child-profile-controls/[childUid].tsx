@@ -1,14 +1,15 @@
 import { getAuth, onAuthStateChanged } from '@react-native-firebase/auth';
-import { collection, doc, getDoc, getDocs, getFirestore, serverTimestamp, updateDoc } from '@react-native-firebase/firestore';
+import { collection, doc, getDoc, getDocs, getFirestore, onSnapshot, serverTimestamp, updateDoc } from '@react-native-firebase/firestore';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Image, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { InstalledApp } from '../../../modules/installed-app-inventory/src';
 
 const auth = getAuth();
 const firestore = getFirestore();
 const colors = { background: '#F5F7F5', ink: '#182B27', muted: '#75847F', green: '#237A62', paleGreen: '#E7F2ED', border: '#E2E9E5', white: '#FFFFFF', amber: '#9B6B19', paleAmber: '#FFF5DF' };
+const staleLocationAfterMs = 60_000;
 
 const timeLimits = ['1 hour', '2 hours', '3 hours', '4 hours', 'No limit'];
 const bedtimes = ['8:00 PM', '8:30 PM', '9:00 PM', '9:30 PM', '10:00 PM'];
@@ -16,6 +17,7 @@ const weekdays = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 const appTimeLimitOptions = ['30 min', '1 hour', '2 hours', 'No limit'] as const;
 type AppTimeLimit = typeof appTimeLimitOptions[number];
 type SavedAppTimeLimit = InstalledApp & { limit: AppTimeLimit };
+type SharedLocation = { latitude: number; longitude: number; accuracy: number; updatedAt: unknown };
 
 export default function ChildControlsScreen() {
   const { childUid: routeChildUid } = useLocalSearchParams<{ childUid: string }>();
@@ -38,10 +40,20 @@ export default function ChildControlsScreen() {
   const [draftAppTimeLimit, setDraftAppTimeLimit] = useState<AppTimeLimit>('No limit');
   const [isSavingAppLimit, setIsSavingAppLimit] = useState(false);
   const [appLimitError, setAppLimitError] = useState<string | null>(null);
+  const [locationSharingEnabled, setLocationSharingEnabled] = useState(false);
+  const [sharedLocation, setSharedLocation] = useState<SharedLocation | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [locationCheckedAt, setLocationCheckedAt] = useState(() => Date.now());
 
   useEffect(() => {
     let active = true;
+    let stopChildStatus: (() => void) | undefined;
+    let stopLocation: (() => void) | undefined;
     const unsubscribe = onAuthStateChanged(auth, (user) => {
+      stopChildStatus?.();
+      stopLocation?.();
+      stopChildStatus = undefined;
+      stopLocation = undefined;
       if (!user) {
         router.replace('/');
         return;
@@ -55,6 +67,31 @@ export default function ChildControlsScreen() {
         setIsLoading(false);
         return;
       }
+
+      const childRef = doc(firestore, 'users', user.uid, 'children', childUid);
+      stopChildStatus = onSnapshot(childRef, (snapshot) => {
+        if (!active) return;
+        const data = snapshot.data();
+        if (!snapshot.exists() || data?.parentUid !== user.uid) {
+          setLocationSharingEnabled(false);
+          setSharedLocation(null);
+          setLocationError('This child is no longer connected to your family.');
+          return;
+        }
+        setLocationSharingEnabled(data.locationSharingEnabled === true);
+        setLocationError(null);
+      }, () => {
+        if (active) setLocationError('Could not load location-sharing status.');
+      });
+      stopLocation = onSnapshot(doc(firestore, 'users', user.uid, 'children', childUid, 'liveLocation', 'current'), (snapshot) => {
+        if (active) {
+          setSharedLocation(snapshot.exists() ? readSharedLocation(snapshot.data()) : null);
+          setLocationCheckedAt(Date.now());
+          setLocationError(null);
+        }
+      }, () => {
+        if (active) setLocationError('Could not load the shared location.');
+      });
 
       getDoc(doc(firestore, 'users', user.uid, 'children', childUid))
         .then((snapshot) => {
@@ -99,8 +136,16 @@ export default function ChildControlsScreen() {
     return () => {
       active = false;
       unsubscribe();
+      stopChildStatus?.();
+      stopLocation?.();
     };
   }, [childUid]);
+
+  useEffect(() => {
+    if (!sharedLocation) return undefined;
+    const interval = setInterval(() => setLocationCheckedAt(Date.now()), 10_000);
+    return () => clearInterval(interval);
+  }, [sharedLocation]);
 
   const toggleDay = (dayIndex: number) => {
     setSelectedDays((current) => current.includes(dayIndex)
@@ -119,6 +164,13 @@ export default function ChildControlsScreen() {
   const hasAppLimitChanges = Boolean(selectedApp && draftAppTimeLimit !== (selectedSavedLimit?.limit ?? 'No limit'));
   const filteredApps = installedApps
     .filter((app) => app.appName.toLocaleLowerCase().includes(appSearch.trim().toLocaleLowerCase()));
+  const locationUpdatedAt = readTimestamp(sharedLocation?.updatedAt);
+  const locationAgeMs = locationUpdatedAt ? locationCheckedAt - locationUpdatedAt.getTime() : null;
+  const isLocationFresh = locationSharingEnabled
+    && sharedLocation !== null
+    && locationAgeMs !== null
+    && locationAgeMs >= 0
+    && locationAgeMs <= staleLocationAfterMs;
 
   const saveSelectedAppLimit = async () => {
     const parentUid = auth.currentUser?.uid;
@@ -140,6 +192,16 @@ export default function ChildControlsScreen() {
       setAppLimitError('Could not save this app limit. Check your connection and try again.');
     } finally {
       setIsSavingAppLimit(false);
+    }
+  };
+
+  const openSharedLocation = async () => {
+    if (!isLocationFresh || !sharedLocation) return;
+    const url = `https://www.google.com/maps/search/?api=1&query=${sharedLocation.latitude},${sharedLocation.longitude}`;
+    try {
+      await Linking.openURL(url);
+    } catch {
+      setLocationError('Could not open a maps app on this device.');
     }
   };
 
@@ -314,9 +376,31 @@ export default function ChildControlsScreen() {
 
             <View style={styles.controlCard}>
               <Text style={styles.controlTitle}>Live device information</Text>
-              <Text style={styles.controlDescription}>These live features are not connected in this preview.</Text>
+              <Text style={styles.controlDescription}>Live location is child-controlled. Other live features are not connected.</Text>
               <View style={styles.liveFeatureList}>
-                <UnavailableFeature title="Live location" description="Location is not collected or streamed." />
+                <View style={styles.liveFeature}>
+                  <View style={styles.liveFeatureHeading}>
+                    <Text style={styles.liveFeatureTitle}>Live location</Text>
+                    <Text style={[styles.unavailableLabel, isLocationFresh && styles.locationActiveLabel]}>
+                      {isLocationFresh ? 'Live now' : locationSharingEnabled ? 'Waiting / stale' : 'Sharing off'}
+                    </Text>
+                  </View>
+                  <Text style={styles.liveFeatureDescription}>
+                    {isLocationFresh && sharedLocation && locationUpdatedAt
+                      ? `Updated ${formatLocationAge(locationAgeMs ?? 0)} · accuracy about ${Math.round(sharedLocation.accuracy)} m`
+                      : locationSharingEnabled
+                        ? sharedLocation
+                          ? 'The last point is too old to show as live. Ask the child to reopen Nestguard.'
+                          : 'Waiting for the child device to send its first location update.'
+                        : 'The child has not enabled location sharing. Location is visible only while the child app is open; old points are hidden after one minute.'}
+                  </Text>
+                  {locationError ? <Text accessibilityRole="alert" style={styles.inlineErrorText}>{locationError}</Text> : null}
+                  {isLocationFresh ? (
+                    <Pressable accessibilityRole="button" onPress={() => { void openSharedLocation(); }} style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}>
+                      <Text style={styles.mapButtonText}>Open in Maps</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
                 <UnavailableFeature title="Live screen" description="No screenshots or screen recordings are captured." />
                 <UnavailableFeature title="Notifications" description="Notification contents are not collected." />
                 <UnavailableFeature title="SMS" description="SMS messages and their contents are not collected." />
@@ -366,6 +450,26 @@ function readSavedAppTimeLimits(value: unknown): SavedAppTimeLimit[] {
     && typeof limit.limit === 'string'
     && appTimeLimitOptions.some((option) => option === limit.limit)
   ));
+}
+
+function readSharedLocation(value: Record<string, unknown>): SharedLocation | null {
+  const { latitude, longitude, accuracy, updatedAt } = value;
+  if (
+    typeof latitude !== 'number'
+    || typeof longitude !== 'number'
+    || typeof accuracy !== 'number'
+  ) return null;
+  return { latitude, longitude, accuracy, updatedAt };
+}
+
+function readTimestamp(value: unknown): Date | null {
+  if (typeof value !== 'object' || value === null || !('toDate' in value) || typeof value.toDate !== 'function') return null;
+  return value.toDate();
+}
+
+function formatLocationAge(ageMs: number) {
+  const seconds = Math.max(0, Math.floor(ageMs / 1000));
+  return seconds < 60 ? `${seconds} sec ago` : `${Math.floor(seconds / 60)} min ago`;
 }
 
 function UnavailableFeature({ title, description }: { title: string; description: string }) {
@@ -419,7 +523,10 @@ const styles = StyleSheet.create({
   liveFeatureHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
   liveFeatureTitle: { color: colors.ink, fontSize: 11, fontWeight: '800' },
   unavailableLabel: { color: colors.amber, fontSize: 9, fontWeight: '800' },
+  locationActiveLabel: { color: colors.green },
   liveFeatureDescription: { color: colors.muted, fontSize: 10, lineHeight: 15, marginTop: 4 },
+  mapButton: { minHeight: 38, alignItems: 'center', justifyContent: 'center', marginTop: 10, paddingHorizontal: 12, borderRadius: 9, backgroundColor: colors.green },
+  mapButtonText: { color: colors.white, fontSize: 10, fontWeight: '800' },
   switchTrack: { width: 48, height: 28, borderRadius: 15, backgroundColor: '#DDE4E0', justifyContent: 'center', padding: 3, alignSelf: 'flex-end' },
   switchTrackOn: { backgroundColor: colors.green },
   switchThumb: { width: 22, height: 22, borderRadius: 11, backgroundColor: colors.white, elevation: 1 },

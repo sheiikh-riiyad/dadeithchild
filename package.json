@@ -18,6 +18,7 @@
     "expo-glass-effect": "~58.0.5",
     "expo-image": "~58.0.18",
     "expo-linking": "~58.0.16",
+    "expo-location": "~58.0.22",
     "expo-router": "~58.0.30",
     "expo-splash-screen": "~58.0.13",
     "expo-status-bar": "~58.0.4",
@@ -38,6 +39,7 @@
     "@types/react": "~19.3.0",
     "eslint": "^9.0.0",
     "eslint-config-expo": "~58.0.4",
+    "nodemon": "^3.1.14",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -46,7 +48,9 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "backend": "node appbackend.js",
+    "backend:dev": "nodemon appbackend.js"
   },
   "private": true
 }
